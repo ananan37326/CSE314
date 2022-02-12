@@ -1,0 +1,589 @@
+diff --git a/Makefile b/Makefile
+index 655384c..3a3c964 100644
+--- a/Makefile
++++ b/Makefile
+@@ -71,6 +71,11 @@ QEMU = $(shell if which qemu > /dev/null; \
+ 	echo "***" 1>&2; exit 1)
+ endif
+ 
++# added for offline4
++ifndef PRALG
++	PRALG = FIFO
++endif
++
+ CC = $(TOOLPREFIX)gcc
+ AS = $(TOOLPREFIX)gas
+ LD = $(TOOLPREFIX)ld
+@@ -78,6 +83,7 @@ OBJCOPY = $(TOOLPREFIX)objcopy
+ OBJDUMP = $(TOOLPREFIX)objdump
+ CFLAGS = -fno-pic -static -fno-builtin -fno-strict-aliasing -O2 -Wall -MD -ggdb -m32 -Werror -fno-omit-frame-pointer
+ CFLAGS += $(shell $(CC) -fno-stack-protector -E -x c /dev/null >/dev/null 2>&1 && echo -fno-stack-protector)
++CFLAGS += -D$(PRALG)
+ ASFLAGS = -m32 -gdwarf-2 -Wa,-divide
+ # FreeBSD ld wants ``elf_i386_fbsd''
+ LDFLAGS += -m $(shell $(LD) -V | grep elf_i386 2>/dev/null | head -n 1)
+diff --git a/defs.h b/defs.h
+index f33f2cb..d60192e 100644
+--- a/defs.h
++++ b/defs.h
+@@ -195,6 +195,9 @@ void            switchuvm(struct proc*);
+ void            switchkvm(void);
+ int             copyout(pde_t*, uint, void*, uint);
+ void            clearpteu(pde_t *pgdir, char *uva);
++void            swap_in(uint addr); // added for offline4, move a swap file to memory
++void            allocate_page(char *vaddr); // added for offline4, allocate a new page in memory
++struct page_q   *swap_out(char *vaddr); // added for offline4, write a page to swap file
+ 
+ // number of elements in fixed-size array
+ #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
+diff --git a/exec.c b/exec.c
+index b40134f..3852561 100644
+--- a/exec.c
++++ b/exec.c
+@@ -29,6 +29,32 @@ exec(char *path, char **argv)
+   ilock(ip);
+   pgdir = 0;
+ 
++  // added for offline4
++  struct swap_info swapinfos[MAX_PSYC_PAGE];
++  struct page_q memoryinfos[MAX_PSYC_PAGE];
++  int memory_pages = curproc->pages_in_memory;
++  int swap_pages = curproc->pages_in_swap;
++  struct page_q *p_head = curproc->q_head;
++
++  for (int i = 0; i < MAX_PSYC_PAGE; i++)
++  {
++    /* code */
++    swapinfos[i].vaddr = curproc->swap_info[i].vaddr;
++    swapinfos[i].contains_data = curproc->swap_info[i].contains_data;
++    memoryinfos[i].vaddr = curproc->memory_info[i].vaddr;
++    memoryinfos[i].next = curproc->memory_info[i].next;
++
++    curproc->swap_info[i].vaddr = (char*)0x00000000;
++    curproc->swap_info[i].contains_data = 0;
++    curproc->memory_info[i].vaddr = (char*)0x00000000;
++    curproc->memory_info[i].next = 0;
++  }
++
++  curproc->pages_in_memory = 0;
++  curproc->pages_in_swap = 0;
++  curproc->q_head = 0;
++  
++
+   // Check ELF header
+   if(readi(ip, (char*)&elf, 0, sizeof(elf)) != sizeof(elf))
+     goto bad;
+@@ -99,6 +125,25 @@ exec(char *path, char **argv)
+   curproc->sz = sz;
+   curproc->tf->eip = elf.entry;  // main
+   curproc->tf->esp = sp;
++
++  // added for offline4
++  for (int i = 0; i < MAX_PSYC_PAGE; i++)
++  {
++    /* code */
++    curproc->swap_info[i].vaddr = (char*)0x00000000;
++    curproc->swap_info[i].contains_data = 0;
++    curproc->memory_info[i].vaddr = (char*)0x00000000;
++    curproc->memory_info[i].next = 0;
++  }
++
++  curproc->q_head = 0;
++  removeSwapFile(curproc);
++  createSwapFile(curproc);
++  cprintf("Allocated %d pages for process %s, pid %d\n", curproc->pages_in_memory, curproc->name,curproc->pid);
++
++  
++
++
+   switchuvm(curproc);
+   freevm(oldpgdir);
+   return 0;
+@@ -109,6 +154,22 @@ exec(char *path, char **argv)
+   if(ip){
+     iunlockput(ip);
+     end_op();
++
++    // added for offline4
++    curproc->pages_in_memory = memory_pages;
++    curproc->pages_in_swap = swap_pages;
++    curproc->q_head = p_head;
++
++    for (int i = 0; i < MAX_PSYC_PAGE; i++)
++    {
++      /* code */
++      curproc->swap_info[i].vaddr = swapinfos[i].vaddr;
++      curproc->swap_info[i].contains_data = swapinfos[i].contains_data;
++      curproc->memory_info[i].vaddr = memoryinfos[i].vaddr;
++      curproc->memory_info[i].next = memoryinfos[i].next;
++    }
++    
++
+   }
+   return -1;
+ }
+diff --git a/proc.c b/proc.c
+index dc3a2dc..e585bf6 100644
+--- a/proc.c
++++ b/proc.c
+@@ -116,9 +116,9 @@ found:
+   for (int i = 0; i < MAX_PSYC_PAGE; i++)
+   {
+     /* code */
+-    p->memory_info[i].vaddr = 0;
++    p->memory_info[i].vaddr = (char*)0x00000000;
+     p->memory_info[i].next = 0;
+-    p->swap_info[i].vaddr = 0;
++    p->swap_info[i].vaddr = (char*)0x00000000;
+     p->swap_info[i].contains_data = 0;
+   }
+   p->pages_in_memory = 0;
+@@ -238,8 +238,8 @@ fork(void)
+   int read_bytes = 0;
+   int offset = 0;
+ 
+-  if (curproc->pid !=1 && curproc->pid !=2)
+-  {
++  //if (curproc->pid !=1 && curproc->pid !=2)
++  //{
+     /* code */
+     while (1)
+     {
+@@ -259,7 +259,7 @@ fork(void)
+       
+     }
+     
+-  }
++  //}
+ 
+   int idx = 0;
+   while (idx< MAX_PSYC_PAGE)
+@@ -594,10 +594,10 @@ procdump(void)
+   // Change for offline 4
+   uint pagetables[MAX_TOTAL_PAGES]; // array of page tables
+   int pagetable_index = 0; // index of page table
+-  int vpn[NPTENTRIES]; // virtual page number array
++  int vpn[MAX_TOTAL_PAGES]; // virtual page number array
+ 
+   for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
+-    if(p->state == UNUSED)
++    if(p->state == UNUSED || p->state == EMBRYO)
+       continue;
+     if(p->state >= 0 && p->state < NELEM(states) && states[p->state])
+       state = states[p->state];
+diff --git a/trap.c b/trap.c
+index 41c66eb..27cbd4f 100644
+--- a/trap.c
++++ b/trap.c
+@@ -36,6 +36,9 @@ idtinit(void)
+ void
+ trap(struct trapframe *tf)
+ {
++  uint paddr;
++  pde_t *vaddr;
++
+   if(tf->trapno == T_SYSCALL){
+     if(myproc()->killed)
+       exit();
+@@ -78,6 +81,25 @@ trap(struct trapframe *tf)
+     lapiceoi();
+     break;
+ 
++  case T_PGFLT:
++    paddr = rcr2();
++    vaddr = &myproc()->pgdir[PDX(paddr)];
++
++    cprintf("Physical address %x, Virtual address %x\n", paddr, vaddr);
++
++    if((int)(*vaddr) & PTE_P){
++      if (((uint*)PTE_ADDR(P2V(*vaddr)))[PTX(paddr)] & PTE_PG)
++      {
++        /* code */
++        cprintf("Page is in swap file at %p with pid %d\n",vaddr,myproc()->pid);
++        swap_in(PTE_ADDR(paddr));
++        return;
++      }
++      
++    }
++
++    break;
++
+   //PAGEBREAK: 13
+   default:
+     if(myproc() == 0 || (tf->cs&3) == 0){
+diff --git a/vm.c b/vm.c
+index 6502f18..3e6908b 100644
+--- a/vm.c
++++ b/vm.c
+@@ -68,8 +68,11 @@ mappages(pde_t *pgdir, void *va, uint size, uint pa, int perm)
+   for(;;){
+     if((pte = walkpgdir(pgdir, a, 1)) == 0)
+       return -1;
+-    if(*pte & PTE_P)
+-      panic("remap");
++    if(*pte & PTE_P){
++        cprintf("%s\n",myproc()->name);
++        panic("remap");
++    }
++      
+     *pte = pa | perm | PTE_P;
+     if(a == last)
+       break;
+@@ -216,6 +219,228 @@ loaduvm(pde_t *pgdir, char *addr, struct inode *ip, uint offset, uint sz)
+   return 0;
+ }
+ 
++// added for offline 4
++void swap_in(uint addr){
++  // for init and shell
++  //if(myproc()->pid == 1 || myproc()->pid == 2){
++  //  myproc()->pages_in_memory++;
++  //  return;
++  //}
++
++  pte_t *to_be_swapped;
++  pte_t *tmp;
++  char buffer[NPTENTRIES];
++  char alg_name[10];
++  struct page_q *head = myproc()->q_head;
++
++  #if FIFO
++    strncpy(alg_name, "FIFO",10);
++  #endif // FIFO
++
++  
++
++  #if NRU
++    strncpy(alg_name, "NRU",10);
++  #endif // NRU
++
++  if (head==0)
++  {
++    /* code */
++    panic("Error : Empty list, nothing to swap");
++  }
++  if (head->next==0)
++  {
++    /* code */
++    panic("Error : Only one page in the memory");
++  }
++  
++  struct page_q *tmp_q = head->next;
++  while (tmp_q->next!=0)
++  {
++    /* code */
++    tmp_q = tmp_q->next;
++  }
++  head->next = 0;
++  
++  cprintf("%s : Swapping page at %x\n",alg_name,tmp_q->vaddr);
++  
++  to_be_swapped = walkpgdir(myproc()->pgdir, (void*)tmp_q->vaddr, 0);
++  if (*to_be_swapped == 0)
++  {
++    /* code */
++    panic("Error : Address not found in the page table");
++  }
++  
++  
++  int i = -1;
++  
++
++  #if FIFO
++  for (int j = 0; j < MAX_PSYC_PAGE; j++)
++  {
++    /* code */
++    cprintf("(vaddr : %x",myproc()->swap_info[j].vaddr);
++    if (myproc()->swap_info[j].vaddr == (char*)PTE_ADDR(addr))
++    {
++      /* code */
++      i = j;
++      break;
++    }
++    
++  }
++  #endif // FIFO
++
++  #if NRU
++    i = 1
++  #endif // NRU
++
++  if (i == -1)
++  {
++    /* code */
++    panic("Error : Page not found in the swap table");
++  }
++
++  myproc()->swap_info[i].vaddr = tmp_q->vaddr; // we assume that the memory is full, so if full then we allocate a blank page to the file 
++
++  tmp = walkpgdir(myproc()->pgdir, (void*)addr, 0);
++  if(tmp == 0){
++    panic("Error : Cannot create page, PG_FAULT");
++  }
++
++  *tmp = PTE_ADDR(*to_be_swapped) | PTE_P | PTE_W | PTE_U;
++
++  for (int j = 0; i < 4; i++)
++  {
++    /* code */
++    int idx = (PGSIZE*i) + ((PGSIZE/4)*j);
++    int offset = ((PGSIZE/4)*j);
++    memset(buffer, 0, NPTENTRIES);
++
++    readFromSwapFile(myproc(), buffer, idx, NPTENTRIES);
++    char* to_be_written = (char*)P2V_WO(PTE_ADDR(*to_be_swapped) + offset);
++    writeToSwapFile(myproc(), to_be_written, idx, NPTENTRIES);
++    memmove((void*)PTE_ADDR(addr) + offset, (void*)buffer, NPTENTRIES);
++  }
++
++  *to_be_swapped &= ~PTE_P;
++  *to_be_swapped |= PTE_PG | PTE_W | PTE_U;
++
++  tmp_q->next = myproc()->q_head;
++  myproc()->q_head = tmp_q;
++  tmp_q->vaddr = (char*)PTE_ADDR(addr);
++  lcr3(V2P(myproc()->pgdir));
++  
++
++}
++
++struct page_q *swap_out(char* vaddr){
++  struct proc *curproc = myproc();
++  struct page_q *head, *tmp_q;
++  char alg_name[10];
++  int i = -1;
++
++  #if FIFO
++    strncpy(alg_name, "FIFO",10);
++    for (int j = 0; j < MAX_PSYC_PAGE; j++)
++    {
++      /* code */
++      if (curproc->swap_info[j].vaddr == (char*)0x00000000)
++      {
++        /* code */
++        i = j;
++        break;
++      }
++      
++    }
++    
++  #endif // FIFO
++
++  #if NRU
++    strncpy(alg_name, "NRU",10);
++    i = 1;
++  #endif // NRU
++
++  if (i==-1)
++    {
++      /* code */
++      panic("Error : No slot found in the swap table");
++    }
++
++    head = curproc->q_head;
++    if (head==0)
++    {
++      /* code */
++      panic("Error : Empty list, nothing to swap");
++    }
++    if (head->next==0)
++    {
++      /* code */
++      panic("Error : Only one page in the memory");
++    }
++    
++    tmp_q = head->next;
++    while (tmp_q->next!=0)
++    {
++      /* code */
++      tmp_q = tmp_q->next;
++    }
++    head->next = 0;
++
++    curproc->swap_info[i].vaddr = tmp_q->vaddr;
++    curproc->swap_info[i].contains_data = 1;
++
++    int bytes_written = writeToSwapFile(curproc, (char*)PTE_ADDR(tmp_q->vaddr), i*PGSIZE, PGSIZE);
++    if (bytes_written == 0) {
++      return 0;
++    }
++
++    pte_t *to_be_swapped = walkpgdir(curproc->pgdir, (void*)tmp_q->vaddr, 0);
++    if (*to_be_swapped == 0)
++    {
++      /* code */
++      panic("Error : Address not found in the swap");
++    }
++
++    kfree((char*)PTE_ADDR(P2V_WO(*walkpgdir(curproc->pgdir, (void*)tmp_q->vaddr, 0))));
++    *to_be_swapped &= ~PTE_P;
++    *to_be_swapped |= PTE_PG | PTE_W | PTE_U;
++    curproc->pages_in_swap++;
++
++    cprintf("Writing %d bytes to swap file pid %d at vaddr %x\n", bytes_written, curproc->pid, tmp_q->vaddr);
++
++    lcr3(V2P(curproc->pgdir));
++
++    return tmp_q;
++
++}
++
++void allocate_page(char* vaddr){
++  struct proc *curproc = myproc();
++  int i = -1;
++  for (int j = 0; j < MAX_PSYC_PAGE; j++)
++    {
++      /* code */
++      if (curproc->memory_info[j].vaddr == (char*)0x00000000)
++      {
++        /* code */
++        i = j;
++        break;
++      }
++      
++    }
++
++  if (i==-1)
++    {
++      /* code */
++      panic("Error : Not enough space for page allocation");
++    }
++
++  curproc->memory_info[i].vaddr = vaddr;
++  curproc->memory_info[i].next = curproc->q_head;
++  curproc->q_head = &curproc->memory_info[i];
++  curproc->pages_in_memory++;
++}
++
+ // Allocate page tables and physical memory to grow process from oldsz to
+ // newsz, which need not be page aligned.  Returns new size or 0 on error.
+ int
+@@ -223,6 +448,10 @@ allocuvm(pde_t *pgdir, uint oldsz, uint newsz)
+ {
+   char *mem;
+   uint a;
++
++  // added for offline4
++  struct page_q *pg;
++  uint should_alloc = 1;
+   
+ 
+   if(newsz >= KERNBASE)
+@@ -233,12 +462,31 @@ allocuvm(pde_t *pgdir, uint oldsz, uint newsz)
+ 
+   a = PGROUNDUP(oldsz);
+   for(; a < newsz; a += PGSIZE){
++    // added for offline4
++    if (myproc()->pages_in_memory >= MAX_PSYC_PAGE){
++      pg = swap_out((char*)a);
++      if (pg == 0) {
++        panic("Error : Cannot swap out");
++      }
++      pg->vaddr = (char*)a;
++      pg->next = myproc()->q_head;
++      myproc()->q_head = pg;
++
++      should_alloc = 0;
++    }
++    
+     mem = kalloc();
+     if(mem == 0){
+       cprintf("allocuvm out of memory\n");
+       deallocuvm(pgdir, newsz, oldsz);
+       return 0;
+     }
++
++    // added for offline 4
++    if(should_alloc){
++      allocate_page((char*)a);
++    }
++
+     memset(mem, 0, PGSIZE);
+     if(mappages(pgdir, (char*)a, PGSIZE, V2P(mem), PTE_W|PTE_U) < 0){
+       cprintf("allocuvm out of memory (2)\n");
+@@ -275,10 +523,85 @@ deallocuvm(pde_t *pgdir, uint oldsz, uint newsz)
+       pa = PTE_ADDR(*pte);
+       if(pa == 0)
+         panic("kfree");
++
++      //added for offline4
++      if (myproc()->pgdir == pgdir)
++      {
++        int i = -1;
++        for (int j = 0; j < MAX_PSYC_PAGE; j++)
++        {
++          /* code */
++          if (myproc()->memory_info[j].vaddr == (char*)a)
++          {
++            /* code */
++            i = j;
++            break;
++          }
++          
++        }
++        if (i==-1)
++        {
++          /* code */
++          panic("Error : No entry found in memory info to deallocate memory");
++        }
++
++        myproc()->memory_info[i].vaddr = (char*)0x00000000;
++
++        if (myproc()->q_head == &myproc()->memory_info[i])
++        {
++          /* code */
++          myproc()->q_head = myproc()->memory_info[i].next;
++        }
++        else{
++          struct page_q *tmp_q = myproc()->q_head;
++          while (tmp_q->next!=0)
++          {
++            /* code */
++            if (tmp_q->next == &myproc()->memory_info[i])
++            {
++              /* code */
++              tmp_q->next = myproc()->memory_info[i].next;
++              break;
++            }
++            tmp_q = tmp_q->next;
++          }
++        }
++        myproc()->pages_in_memory--;
++        myproc()->memory_info[i].next = 0;
++        
++
++      }
++      
++
+       char *v = P2V(pa);
+       kfree(v);
+       *pte = 0;
+     }
++    //added for offline4
++    else if ((myproc()->pgdir==pgdir)&&(*pte & PTE_PG))
++    {
++      /* code */
++      int i = -1;
++      for (int j = 0; j < MAX_PSYC_PAGE; j++)
++      {
++        /* code */
++        if (myproc()->swap_info[j].vaddr == (char*)a)
++        {
++          /* code */
++          i = j;
++          break;
++        }
++      }
++      if (i==-1)
++      {
++        /* code */
++        panic("Error : No entry found in swapped pages to deallocate memory");
++      }
++      myproc()->swap_info[i].vaddr = (char*)0x00000000;
++      myproc()->pages_in_swap--;
++      
++    }
++    
+   }
+   return newsz;
+ }
